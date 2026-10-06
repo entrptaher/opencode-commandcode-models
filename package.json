@@ -1,0 +1,37 @@
+{
+  "name": "opencode-commandcode-models",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that auto-discovers CommandCode models and merges any missing ones into the commandcode provider.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "commandcode",
+    "models",
+    "discovery"
+  ],
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.24"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
+  }
+}
