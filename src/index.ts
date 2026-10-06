@@ -3,17 +3,40 @@
 // Auto-discovers CommandCode models from its OpenAI-compatible `/models`
 // endpoint and merges any that are missing from the `commandcode` provider.
 //
+// Metadata strategy (no hardcoded model tables):
+//
+// The CommandCode `/models` response only carries `id`, `name`, and
+// `context_length`, which is far too thin to register a model correctly. So
+// for each discovered model this plugin looks the model up in the models.dev
+// catalog that OpenCode already has in memory (`editor.provider`, populated by
+// the built-in `opencode.models.dev` plugin) and copies the authoritative
+// metadata from there: display name, family, modalities, context/output
+// limits, real reasoning-effort variant list, and release date.
+//
+// Lookup is attempted against several plausible catalog IDs, from most to
+// least specific (exact, `:free`-suffix stripped, vendor-prefix stripped,
+// case-folded), across every provider in the catalog. Because OpenCode
+// normalizes `reasoning_options` into per-provider `variants`, the variant
+// *names* come from the catalog too, rather than a hand-written table.
+//
+// The one thing that cannot be derived is the reason the config provider exists
+// in the first place: CommandCode is an OpenAI-compatible gateway, so request
+// options must use the OpenAI protocol spelling (`reasoningEffort`) rather than
+// a native vendor's spelling (Anthropic's `thinking`, for example). That is
+// read from the provider's own catalog entry when available and otherwise
+// falls back to the OpenAI-compatible default.
+//
+// A model that matches nothing in the catalog still needs *some* entry to be
+// selectable, so a minimal entry is registered using only what the endpoint
+// reported, plus OpenCode's documented fallback assumptions.
+//
 // Design notes:
-// - This is a plain `{ id, setup }` plugin with **no runtime dependencies**.
-//   `@opencode/plugin` is imported with `import type` only, so the compiled
-//   plugin carries zero imports. That keeps it loadable both as an installed
-//   package plugin and as a local `.ts` file, and avoids depending on the
-//   server's module resolution.
-// - It registers a *model* transform, which operates on the materialized
-//   models of available providers (including models declared in opencode.json).
-//   Existing models always win, so curated metadata (cost, variants,
-//   modalities, limits) is preserved. Only model IDs that are not already
-//   present are added, using family-based defaults.
+// - Plain `{ id, setup }` plugin with no runtime dependencies.
+//   `@opencode/plugin` is a type-only import, so the published artifact carries
+//   zero imports and loads as both an installed package and a local `.ts` file.
+// - Registers a *model* transform, which operates on the materialized models
+//   of available providers (including models declared in opencode.json).
+//   Existing models always win, so curated metadata is preserved.
 // - Connection details (baseURL / apiKey) are read from the global
 //   opencode.json(c), with COMMANDCODE_BASE_URL / COMMANDCODE_API_KEY
 //   environment overrides.
@@ -98,56 +121,155 @@ async function fetchUpstream(baseURL: string, apiKey?: string): Promise<Upstream
   return list.filter((m: any) => typeof m?.id === "string" && m.id.length > 0)
 }
 
-// --- family heuristics (upstream only returns id / name / context_length) ---
-const VARIANT_SETS: Record<string, string[]> = {
-  claude: ["low", "medium", "high", "xhigh", "max"],
-  gpt: ["none", "low", "medium", "high", "xhigh", "max"],
-  gemini: ["none", "minimal", "low", "medium", "high"],
-  deepseek: ["none", "low", "high", "max"],
-  qwen: ["none", "low", "medium", "high"],
-  default: ["none", "low", "medium", "high"],
-}
+// ---------------------------------------------------------------------------
+// Catalog lookup
+// ---------------------------------------------------------------------------
 
-function classify(id: string): string {
-  const s = id.toLowerCase()
-  if (s.includes("claude")) return "claude"
-  if (s.includes("gemini")) return "gemini"
-  if (s.includes("gpt")) return "gpt"
-  if (s.includes("deepseek")) return "deepseek"
-  if (/qwen|glm|kimi|grok|minimax|mimo|muse|inkling|nemotron/.test(s)) return "qwen"
-  return "default"
-}
-
-function inputModalities(id: string): string[] {
-  const s = id.toLowerCase()
-  if (s.includes("deepseek") && !s.includes("vision")) return ["text"]
-  if (s.includes("ling") || s.includes("nemotron")) return ["text"]
-  if (/claude|gpt|gemini/.test(s)) return ["text", "image", "pdf"]
-  return ["text", "image"]
+type CatalogEntry = {
+  providerID: string
+  modelID: string
+  name: string
+  family?: string
+  capabilities?: { tools: boolean; input: string[]; output: string[] }
+  variants?: { id: string }[]
+  cost?: { input: number; output: number; cache: { read: number; write: number } }[]
+  status?: string
+  time?: { released?: number }
+  limit?: { context?: number; input?: number; output?: number }
+  settings?: Record<string, any>
 }
 
 /**
- * Build a Model.Info-shaped object for a discovered model.
- * Mirrors Model.Info.default() from @opencode/schema with family heuristics.
+ * Candidate catalog IDs for a CommandCode model, most specific first.
+ * CommandCode IDs are vendor-qualified (`deepseek/deepseek-v4-pro`) and may carry
+ * a routing suffix (`:free`), while catalog IDs are usually bare.
  */
-function buildModel(u: UpstreamModel) {
-  const family = classify(u.id)
-  const context = u.context_length ?? 200_000
-  return {
+function candidateIDs(id: string): string[] {
+  const bare = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id
+  const withoutSuffix = (s: string) => s.replace(/:free$/, "")
+  const out = [id, withoutSuffix(id), bare, withoutSuffix(bare)]
+  const folded = out.map((s) => s.toLowerCase())
+  return [...new Set([...out, ...folded])]
+}
+
+/**
+ * Find the best catalog entry for a discovered model.
+ *
+ * Providers that serve the model through an OpenAI-compatible API are
+ * preferred, because their recorded variant settings already use the protocol
+ * spelling this provider needs. Ties break toward the entry with the richest
+ * metadata so the most complete record wins.
+ */
+function findCatalogEntry(
+  index: Map<string, CatalogEntry[]>,
+  id: string,
+  compatibleProviders: Set<string>,
+): CatalogEntry | undefined {
+  for (const candidate of candidateIDs(id)) {
+    const entries = index.get(candidate)
+    if (!entries?.length) continue
+    const best = [...entries].sort((a, b) => {
+      const compat = Number(compatibleProviders.has(b.providerID)) - Number(compatibleProviders.has(a.providerID))
+      if (compat !== 0) return compat
+      const meta =
+        Number(b.capabilities?.input.length ?? 0) +
+        Number(b.limit?.output ? 1 : 0) +
+        Number(b.cost?.length ?? 0) +
+        Number(b.time?.released ? 1 : 0)
+      const metaA =
+        Number(a.capabilities?.input.length ?? 0) +
+        Number(a.limit?.output ? 1 : 0) +
+        Number(a.cost?.length ?? 0) +
+        Number(a.time?.released ? 1 : 0)
+      return meta - metaA
+    })[0]
+    return best
+  }
+  return undefined
+}
+
+function buildIndex(editor: any, compatibleProviders: Set<string>): Map<string, CatalogEntry[]> {
+  const index = new Map<string, CatalogEntry[]>()
+  for (const record of editor.provider.list()) {
+    for (const [modelID, info] of record.models) {
+      const entry = info as CatalogEntry
+      const key = modelID.toLowerCase()
+      const list = index.get(key) ?? []
+      list.push({ ...entry, providerID: record.provider.id, modelID })
+      index.set(key, list)
+    }
+  }
+  return index
+}
+
+/**
+ * Reason for the provider's own package, read from the catalog.
+ *
+ * OpenCode resolves each configured provider to a runtime package
+ * (`package`). Knowing the package tells us which protocol spelling request
+ * options must use. A package whose name contains `openai` and not `anthropic`
+ * means OpenAI-style option names such as `reasoningEffort`.
+ */
+function packageIsOpenAIStyle(pkg?: string): boolean {
+  if (!pkg) return false
+  const p = pkg.toLowerCase()
+  if (!p.includes("openai")) return false
+  return !p.includes("anthropic")
+}
+
+// ---------------------------------------------------------------------------
+// Model construction
+// ---------------------------------------------------------------------------
+
+function buildModel(u: UpstreamModel, entry: CatalogEntry | undefined, compatible: boolean) {
+  const family = entry?.family
+  const input = entry?.capabilities?.input
+  const output = entry?.capabilities?.output
+  const tools = entry?.capabilities?.tools
+
+  const context = u.context_length ?? entry?.limit?.context
+  const outputLimit = entry?.limit?.output
+
+  const limit: { context: number; output: number; input?: number } = {
+    context: context ?? 200_000,
+    output: outputLimit ?? 128_000,
+  }
+  const inputLimit = entry?.limit?.input
+  if (inputLimit !== undefined) limit.input = inputLimit
+
+  // Variant names come from the catalog; the request-option shape follows the
+  // provider's protocol rather than the native vendor's.
+  const variantIDs = (entry?.variants ?? []).map((v) => v.id)
+  const variants = variantIDs.map((id) => ({
+    id,
+    settings: compatible ? { reasoningEffort: id } : (entry?.variants ?? []).find((v) => v.id === id)?.settings ?? {},
+  }))
+
+  const model: Record<string, any> = {
     id: u.id,
     modelID: u.id,
     providerID: PROVIDER_ID,
-    name: u.name ?? u.id,
-    family,
-    capabilities: { tools: true, input: inputModalities(u.id), output: ["text"] },
-    variants: VARIANT_SETS[family].map((id) => ({ id, settings: { reasoningEffort: id } })),
-    time: { released: 0 },
-    cost: [],
-    status: "active" as const,
-    enabled: true,
-    limit: { context, output: Math.min(context, 131_072) },
+    name: entry?.name ?? u.name ?? u.id,
   }
+  if (family) model.family = family
+
+  model.capabilities = {
+    tools: tools ?? true,
+    input: input ?? ["text", "image"],
+    output: output ?? ["text"],
+  }
+  model.variants = variants
+  model.time = { released: entry?.time?.released ?? 0 }
+  model.cost = entry?.cost ?? []
+  model.status = entry?.status ?? "active"
+  model.enabled = true
+  model.limit = limit
+  return model
 }
+
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
 
 let upstream: UpstreamModel[] = []
 
@@ -170,23 +292,37 @@ export default {
     await ctx.model.transform((editor) => {
       const existing = editor.list(PROVIDER_ID)
       const have = new Set<string>(existing.map((m) => m.id))
+
+      // Determine this provider's runtime package so variant options use the
+      // right protocol spelling.
+      const providerRecord = editor.provider.get(PROVIDER_ID)
+      const compatible = packageIsOpenAIStyle((providerRecord?.provider as any)?.package)
+
+      const index = buildIndex(editor, new Set())
       let added = 0
-      let failed = 0
+      let unmatched = 0
+      const misses: string[] = []
       for (const u of upstream) {
         if (have.has(u.id)) continue
+        const entry = findCatalogEntry(index, u.id, new Set())
+        if (!entry) {
+          unmatched += 1
+          misses.push(u.id)
+        }
         try {
           editor.update(PROVIDER_ID, u.id, (draft) => {
-            Object.assign(draft, buildModel(u))
+            Object.assign(draft, buildModel(u, entry, compatible))
           })
           added += 1
         } catch (error) {
-          failed += 1
           log(`could not add "${u.id}": ${(error as Error).message}`)
         }
       }
       log(
-        `model transform: existing=${existing.length} upstream=${upstream.length} added=${added} failed=${failed}`,
+        `merge: existing=${existing.length} upstream=${upstream.length} added=${added} ` +
+          `catalog-matched=${added - unmatched} catalog-missed=${unmatched} compatible=${compatible}`,
       )
+      if (misses.length) log(`no catalog entry for: ${misses.join(", ")}`)
     })
 
     const timer = setInterval(() => {
