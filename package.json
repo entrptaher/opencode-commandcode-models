@@ -23,6 +23,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@opencode/plugin": "2.0.24",
     "@types/node": "^22.13.9",
     "typescript": "^5.8.2"
   },

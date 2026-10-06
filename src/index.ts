@@ -41,7 +41,7 @@
 //   opencode.json(c), with COMMANDCODE_BASE_URL / COMMANDCODE_API_KEY
 //   environment overrides.
 
-import type { Context } from "@opencode/plugin"
+import type { Context } from "@opencode/plugin/promise/plugin"
 import { appendFileSync, existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -144,7 +144,7 @@ type CatalogEntry = {
  * CommandCode IDs are vendor-qualified (`deepseek/deepseek-v4-pro`) and may carry
  * a routing suffix (`:free`), while catalog IDs are usually bare.
  */
-function candidateIDs(id: string): string[] {
+export function candidateIDs(id: string): string[] {
   const bare = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id
   const withoutSuffix = (s: string) => s.replace(/:free$/, "")
   const out = [id, withoutSuffix(id), bare, withoutSuffix(bare)]
@@ -155,42 +155,53 @@ function candidateIDs(id: string): string[] {
 /**
  * Find the best catalog entry for a discovered model.
  *
- * Providers that serve the model through an OpenAI-compatible API are
- * preferred, because their recorded variant settings already use the protocol
- * spelling this provider needs. Ties break toward the entry with the richest
- * metadata so the most complete record wins.
+ * Entries carrying richer metadata win, so the most complete record is chosen
+ * when several providers list the same model.
  */
-function findCatalogEntry(
+export function findCatalogEntry(
   index: Map<string, CatalogEntry[]>,
   id: string,
-  compatibleProviders: Set<string>,
 ): CatalogEntry | undefined {
+  const score = (e: CatalogEntry) =>
+    Number(e.capabilities?.input.length ?? 0) +
+    Number(e.limit?.output ? 1 : 0) +
+    Number(e.cost?.length ? 1 : 0) +
+    Number(e.time?.released ? 1 : 0) +
+    Number(e.variants?.length ? 1 : 0)
+
   for (const candidate of candidateIDs(id)) {
     const entries = index.get(candidate)
     if (!entries?.length) continue
-    const best = [...entries].sort((a, b) => {
-      const compat = Number(compatibleProviders.has(b.providerID)) - Number(compatibleProviders.has(a.providerID))
-      if (compat !== 0) return compat
-      const meta =
-        Number(b.capabilities?.input.length ?? 0) +
-        Number(b.limit?.output ? 1 : 0) +
-        Number(b.cost?.length ?? 0) +
-        Number(b.time?.released ? 1 : 0)
-      const metaA =
-        Number(a.capabilities?.input.length ?? 0) +
-        Number(a.limit?.output ? 1 : 0) +
-        Number(a.cost?.length ?? 0) +
-        Number(a.time?.released ? 1 : 0)
-      return meta - metaA
-    })[0]
-    return best
+    return [...entries].sort((a, b) => score(b) - score(a))[0]
   }
   return undefined
 }
 
-function buildIndex(editor: any, compatibleProviders: Set<string>): Map<string, CatalogEntry[]> {
+/**
+ * Keep only variant names that map onto a reasoning-effort level.
+ *
+ * OpenCode normalizes a model's `reasoning_options` into `variants`, and some
+ * models carry non-effort entries (for example a boolean `thinking` toggle).
+ * Requesting a variant that is not an effort level would send an unsupported
+ * value, so those are dropped rather than forwarded.
+ */
+function effortVariants(entry: CatalogEntry | undefined, compatible: boolean) {
+  const variants = entry?.variants ?? []
+  const effortIds = variants
+    .map((v) => (typeof v === "string" ? v : v?.id))
+    .filter((id): id is string => typeof id === "string" && id !== "thinking")
+  return effortIds.map((id) => ({
+    id,
+    settings: compatible ? { reasoningEffort: id } : {},
+  }))
+}
+
+export function buildIndex(editor: { provider: { list(): readonly any[] } }): Map<string, CatalogEntry[]> {
   const index = new Map<string, CatalogEntry[]>()
   for (const record of editor.provider.list()) {
+    // Skip this provider's own entries, otherwise a model already declared in
+    // opencode.json would "match" itself and provide no new information.
+    if (record.provider.id === PROVIDER_ID) continue
     for (const [modelID, info] of record.models) {
       const entry = info as CatalogEntry
       const key = modelID.toLowerCase()
@@ -239,11 +250,7 @@ function buildModel(u: UpstreamModel, entry: CatalogEntry | undefined, compatibl
 
   // Variant names come from the catalog; the request-option shape follows the
   // provider's protocol rather than the native vendor's.
-  const variantIDs = (entry?.variants ?? []).map((v) => v.id)
-  const variants = variantIDs.map((id) => ({
-    id,
-    settings: compatible ? { reasoningEffort: id } : (entry?.variants ?? []).find((v) => v.id === id)?.settings ?? {},
-  }))
+  const variants = effortVariants(entry, compatible)
 
   const model: Record<string, any> = {
     id: u.id,
@@ -291,20 +298,20 @@ export default {
 
     await ctx.model.transform((editor) => {
       const existing = editor.list(PROVIDER_ID)
-      const have = new Set<string>(existing.map((m) => m.id))
+      const have = new Set<string>(existing.map((m: any) => String(m.id)))
 
       // Determine this provider's runtime package so variant options use the
       // right protocol spelling.
       const providerRecord = editor.provider.get(PROVIDER_ID)
       const compatible = packageIsOpenAIStyle((providerRecord?.provider as any)?.package)
 
-      const index = buildIndex(editor, new Set())
+      const index = buildIndex(editor)
       let added = 0
       let unmatched = 0
       const misses: string[] = []
       for (const u of upstream) {
         if (have.has(u.id)) continue
-        const entry = findCatalogEntry(index, u.id, new Set())
+        const entry = findCatalogEntry(index, u.id)
         if (!entry) {
           unmatched += 1
           misses.push(u.id)
